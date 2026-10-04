@@ -1,0 +1,18 @@
+# Пользовательские данные и временные файлы — не публикуются
+data/
+steamcmd/
+backups/
+*.log
+
+# Сборка
+build/
+dist/
+release/
+_internal/
+EldenRingLauncher.exe
+version_info.txt
+__pycache__/
+*.pyc
+
+# Исходники макетов (большие, в сборку не входят)
+design_source/
