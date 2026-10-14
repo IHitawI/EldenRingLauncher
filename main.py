@@ -90,6 +90,12 @@ class Launcher(tk.Tk):
         self.bind("<Unmap>", self._on_unmap)
         self.after(500, self.refresh_steam_background)
         self.after(900, self.refresh_steam_status)
+        self.after(1500, self._restore_loaders_on_start)
+
+    def _restore_loaders_on_start(self):
+        # Лаунчер закрыли во время игры или он упал — возвращаем отключённые загрузчики.
+        if self._settings().get("renamed_loaders") and not saves.game_running():
+            self._restore_loaders()
 
     # ── общие помощники ────────────────────────────────────────────────
 
@@ -531,11 +537,20 @@ class Launcher(tk.Tk):
         for text, command, tip, enabled in (
             (tr("Играть"), lambda: (choose(), self.launch()), tr("Выбрать профиль и запустить игру"), has_profile),
             (tr("Добавить игру"), lambda: mutate(self.add_vanilla), tr("Найти Elden Ring в Steam или указать папку вручную"), True),
-            (tr("Модпак"), lambda: mutate(self.import_modpack), tr("Импорт распакованного модпака (Reforged, Convergence…) — запуск так, как задумал автор"), has_profile),
+            (tr("Модпак"), lambda: self._modpack_source_menu(mutate), tr("Импорт распакованного модпака (Reforged, Convergence…) или профиль прямо из файла .me3"), has_profile),
             (tr("Создать копию"), lambda: mutate(self.create_mod), tr("Скопировать выбранную установку в отдельный мод-профиль"), has_profile),
             (tr("Действия"), self.show_profile_menu, tr("Обложка, папка, моды, путь, переименование, удаление"), has_profile),
         ):
             self._button(actions, text, command, 156, 50, small=False, tooltip=tip, enabled=enabled).pack(side="left", padx=(0, 8))
+
+    def _modpack_source_menu(self, mutate):
+        menu = tk.Menu(self, tearoff=False, bg=PANEL, fg=TEXT, activebackground="#443b2d", activeforeground=GOLD, font=(FONT, -16))
+        menu.add_command(label=tr("Папка модпака… (лаунчер сам найдёт .me3 или загрузчик)"), command=lambda: mutate(self.import_modpack))
+        menu.add_command(label=tr("Файл .me3… (запуск напрямую по нему)"), command=lambda: mutate(self.import_me3_file))
+        try:
+            menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
+        finally:
+            menu.grab_release()
 
     def show_faq(self):
         self._close_tab()
@@ -620,30 +635,77 @@ class Launcher(tk.Tk):
         if not target: return
         target = str(Path(target) / profiles.safe_folder_name(name))
         game_dir = profiles.game_exe(source["path"]).parent
-        try:
-            need = sum(f.stat().st_size for f in game_dir.rglob("*") if f.is_file())
-            free = shutil.disk_usage(Path(target).parent).free
-            if free < need*1.02 and not messagebox.askyesno(
-                    tr("Мало места"), tr("Для копии нужно около {need:.1f} ГБ, а свободно {free:.1f} ГБ.\n\nВсё равно продолжить?").format(
-                        need=need/2**30, free=free/2**30), parent=self):
-                return
-        except OSError:
-            pass
+        problem = profiles.clone_check(str(game_dir), target)
+        if problem:
+            self.log(tr("Копия для модов: {error}").format(error=tr(problem)))
+            return messagebox.showerror(tr("Нельзя создать профиль"), tr(problem), parent=self)
         self.copy_running = True
         self.install_button.configure(state="disabled")
-        self.status.configure(text=tr("Создаю копию мод-профиля…"))
+        self.status.configure(text=tr("Считаю размер игры…"))
         self.bar.configure(mode="indeterminate", value=0)
+        self.bar.start()
         self.progress_detail.configure(text=tr("Лаунчер остаётся доступен; копирование может занять несколько минут."))
+        self.log(tr("Копия для модов: {src} → {dst}").format(src=game_dir, dst=target))
+        self.scene.toast(tr("Создаю копию игры для модов — прогресс внизу"), 4)
         threading.Thread(target=self._create_mod_worker, args=(source, target, name), daemon=True).start()
 
     def _create_mod_worker(self, source, target_path, name):
         error = None
+        copying = False
+        game_dir = str(profiles.game_exe(source["path"]).parent)
         try:
-            profiles.clone_vanilla(str(profiles.game_exe(source["path"]).parent), target_path)
+            files = profiles.game_files(game_dir)
+            need = sum(size for _path, size in files)
+            free = shutil.disk_usage(Path(target_path).parent).free
+            self.log(tr("Размер игры: {need:.1f} ГБ, свободно: {free:.1f} ГБ").format(need=need/2**30, free=free/2**30))
+            if free < need * 1.02:
+                answer = threading.Event()
+                result = {}
+                def ask():
+                    self.bar.stop()
+                    result["ok"] = messagebox.askyesno(
+                        tr("Мало места"), tr("Для копии нужно около {need:.1f} ГБ, а свободно {free:.1f} ГБ.\n\nВсё равно продолжить?").format(
+                            need=need/2**30, free=free/2**30), parent=self)
+                    answer.set()
+                self.after(0, ask)
+                answer.wait()
+                if not result.get("ok"):
+                    raise ValueError(tr("Копирование отменено: не хватает места на диске."))
+            started = time.monotonic()
+            last = {"t": 0.0, "pct": -10}
+            def progress(done, total, file):
+                now = time.monotonic()
+                if now - last["t"] < 0.25 and done < total:
+                    return
+                last["t"] = now
+                pct = done * 100 / total
+                if pct - last["pct"] >= 10:
+                    last["pct"] = pct - pct % 10
+                    self.log(tr("Копирование: {pct:.0f}%").format(pct=pct))
+                speed = done / max(0.1, now - started)
+                left = (total - done) / speed if speed else 0
+                detail = tr("{done:.1f} из {total:.1f} ГБ · осталось ~{min} мин · {file}").format(
+                    done=done/2**30, total=total/2**30, min=max(1, round(left / 60)), file=file)
+                def show():
+                    self.bar.stop()
+                    self.bar.configure(mode="determinate", value=pct)
+                    self.status.configure(text=tr("Копия для модов: {pct:.1f}%").format(pct=pct))
+                    self.progress_detail.configure(text=detail)
+                self.after(0, show)
+            copying = True
+            profiles.clone_vanilla(game_dir, target_path, progress, files)
         except (ValueError, OSError) as exc:
             error = str(exc)
+            if copying and Path(target_path).is_dir():
+                # Папка была пустой или новой (проверено clone_check) — убираем недокопированное.
+                shutil.rmtree(target_path, ignore_errors=True)
+            if isinstance(exc, PermissionError):
+                error = tr("Нет прав на запись в выбранную папку:\n{error}\n\nВыберите папку на другом диске (не Program Files) или запустите лаунчер от имени администратора.").format(error=exc)
+        self.log(tr("Копия для модов: ошибка — {error}").format(error=error) if error
+                 else tr("Копия для модов готова: {path}").format(path=target_path))
         def complete():
             self.copy_running = False
+            self.bar.stop()
             self.bar.configure(mode="determinate", value=0 if error else 100)
             try:
                 if error:
@@ -660,7 +722,8 @@ class Launcher(tk.Tk):
                     self.show_library()
             except (ValueError, OSError) as exc:
                 self.status.configure(text=tr("Ошибка создания профиля"))
-                messagebox.showerror(tr("Нельзя создать профиль"), str(exc), parent=self)
+                self.progress_detail.configure(text=tr(str(exc)).splitlines()[0])
+                messagebox.showerror(tr("Нельзя создать профиль"), tr(str(exc)), parent=self)
             finally:
                 self._update_install_mode()
         self.after(0, complete)
@@ -853,6 +916,9 @@ class Launcher(tk.Tk):
                 if not dll:
                     return messagebox.showerror(tr("Seamless Co-op не найден"), tr("В папке нет ersc.dll. Скачайте Seamless Co-op с Nexus, распакуйте архив целиком и укажите эту папку."), parent=window)
             profiles.add_seamless(self.data, profile, dll)
+            custom = profiles.custom_me3(profile)
+            if custom and profiles.add_seamless_to_me3(custom, dll):
+                self.log(tr("Seamless вписан в свой .me3 первым, с load_early = true: {path}").format(path=custom))
             self.scene.toast(tr("Seamless Co-op подключён к «{name}»").format(name=profile["name"]))
             self.scene.react("smug")
             self.manage_mods()
@@ -931,11 +997,6 @@ class Launcher(tk.Tk):
             self.set_launch_mode(wanted, profile)
             online.set(profiles.launch_mode(profile) == "online")  # если пользователь отказался — вернуть
 
-        def write_manifest():
-            save_options()
-            manifest = profiles.write_me3_profile(self.data, profile)
-            messagebox.showinfo(tr("ME3-профиль сохранён"), tr("Совместимый .me3 создан:\n{path}").format(path=manifest), parent=window)
-
         def conflicts():
             found = profiles.mod_conflicts(profile)
             if not found:
@@ -946,6 +1007,131 @@ class Launcher(tk.Tk):
                 text += "\n" + tr("… и ещё {n}").format(n=len(found)-30)
             self.scene.react("angry")
             messagebox.showinfo(tr("Проверка конфликтов"), text, parent=window)
+
+        # ── файл профиля ME3: автосборка или свой (ручной) ──
+        def pick_custom():
+            path = filedialog.askopenfilename(parent=window, title=tr("Выберите файл профиля .me3"),
+                                              filetypes=[(tr("Профиль Mod Engine 3"), "*.me3"), (tr("Все файлы"), "*.*")])
+            if path:
+                profile["me3_custom"] = str(Path(path).resolve())
+                profiles.save(self.data)
+                self.log(tr("Профиль «{name}» запускается по файлу {path}").format(name=profile["name"], path=path))
+                self.manage_mods()
+
+        def create_custom():
+            save_options()
+            path = profiles.create_custom_me3(self.data, profile)
+            self.log(tr("Создан свой .me3: {path}").format(path=path))
+            self.edit_me3(profile, path)
+
+        def use_auto():
+            profile.pop("me3_custom", None)
+            profiles.save(self.data)
+            self.scene.toast(tr("Файл .me3 снова собирает лаунчер"))
+            self.manage_mods()
+
+        def delete_custom():
+            path = profiles.custom_me3(profile)
+            if not path:
+                return use_auto()
+            if profiles.is_own_custom(path):
+                if not messagebox.askyesno(tr("Удалить .me3"), tr("Удалить свой файл профиля?\n{path}\n\nПрофиль снова будет запускаться по автосборке лаунчера.").format(path=path), parent=window):
+                    return
+                remove_file = True
+            else:
+                answer = messagebox.askyesnocancel(tr("Удалить .me3"), tr("Этот файл не создан лаунчером:\n{path}\n\n«Да» — удалить файл с диска.\n«Нет» — только отвязать от профиля (файл останется).").format(path=path), parent=window)
+                if answer is None:
+                    return
+                remove_file = answer
+            if remove_file:
+                try:
+                    path.unlink()
+                    self.log(tr("Удалён файл {path}").format(path=path))
+                except OSError as exc:
+                    return messagebox.showerror(tr("Не удалось удалить"), str(exc), parent=window)
+            use_auto()
+
+        def choose_pack_file(mod, value):
+            if value == "?":
+                start = mod.get("path") if Path(mod.get("path", "")).is_dir() else None
+                value = filedialog.askopenfilename(parent=window, initialdir=start, title=tr("Профиль .me3 модпака «{name}»").format(name=mod["name"]),
+                                                   filetypes=[(tr("Профиль Mod Engine 3"), "*.me3"), (tr("Все файлы"), "*.*")])
+                if not value:
+                    return
+            if value:
+                mod["me3_file"] = str(Path(value).resolve())
+            else:
+                mod.pop("me3_file", None)
+            mod.pop("pack_disabled", None)  # части другого профиля — список выключенных обнуляем
+            profiles.save(self.data)
+            self.manage_mods()
+
+        def rescan_pack(mod):
+            found = profiles.pack_me3_files(mod["path"], refresh=True)
+            self.scene.toast(tr("Найдено файлов .me3: {n}").format(n=len(found)))
+            self.manage_mods()
+
+        def me3_menu():
+            menu = tk.Menu(window, tearoff=False, bg=PANEL, fg=TEXT, activebackground="#443b2d",
+                           activeforeground=GOLD, selectcolor=GOLD, font=(FONT, -15))
+            custom = profiles.custom_me3(profile)
+            if custom:
+                menu.add_command(label=tr("Редактировать свой .me3"), command=lambda: self.edit_me3(profile, custom))
+                menu.add_command(label=tr("Открыть папку с файлом"), command=lambda: os.startfile(custom.parent))
+                menu.add_command(label=tr("Вернуть автосборку лаунчера"), command=use_auto)
+                menu.add_command(label=tr("Удалить свой .me3…"), command=delete_custom)
+            else:
+                menu.add_command(label=tr("Создать свой .me3 из текущих модов"), command=create_custom)
+                menu.add_command(label=tr("Показать .me3, который соберёт лаунчер"), command=lambda: self.edit_me3(profile, None))
+            menu.add_command(label=tr("Выбрать готовый файл .me3…"), command=pick_custom)
+            menu._vars = []
+            for mod in profile.get("mods", []):
+                if not profiles.is_me3_pack(mod) or not Path(mod.get("path", "")).is_dir():
+                    continue
+                sub = tk.Menu(menu, tearoff=False, bg=PANEL, fg=TEXT, activebackground="#443b2d",
+                              activeforeground=GOLD, selectcolor=GOLD, font=(FONT, -15))
+                current = tk.StringVar(value=mod.get("me3_file", ""))
+                menu._vars.append(current)
+                auto = profiles.choose_pack_profile(profiles.pack_me3_files(mod["path"]), coop_on,
+                                                    profiles.launch_mode(profile) == "online")
+                sub.add_radiobutton(label=tr("Автоматически ({file})").format(file=auto.name if auto else "—"),
+                                    variable=current, value="", command=lambda m=mod: choose_pack_file(m, ""))
+                for file in profiles.pack_me3_files(mod["path"]):
+                    try:
+                        shown = str(file.relative_to(mod["path"]))
+                    except ValueError:
+                        shown = str(file)
+                    sub.add_radiobutton(label=shown, variable=current, value=str(file.resolve()),
+                                        command=lambda m=mod, f=file: choose_pack_file(m, str(f)))
+                sub.add_separator()
+                sub.add_command(label=tr("Другой файл…"), command=lambda m=mod: choose_pack_file(m, "?"))
+                sub.add_command(label=tr("Искать .me3 заново"), command=lambda m=mod: rescan_pack(m))
+                menu.add_separator()
+                menu.add_cascade(label=tr("Профиль модпака «{name}»").format(name=mod["name"]), menu=sub)
+            try:
+                menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
+            finally:
+                menu.grab_release()
+
+        def reset_save():
+            name = profiles.profile_savefile(profile)
+            if not name:
+                return
+            if saves.game_running():
+                return messagebox.showinfo(tr("Игра запущена"), tr("Закройте игру перед сбросом сохранений."), parent=window)
+            files = [f for d in saves.save_dirs() for f in (d / name, d / f"{name}.bak") if f.is_file()]
+            if not files:
+                return messagebox.showinfo(tr("Сейвов нет"), tr("Файла {name} ещё нет — при следующем запуске игра начнёт с чистого листа.").format(name=name), parent=window)
+            if not messagebox.askyesno(tr("Сбросить сейв профиля"), tr("Удалить сохранения этого профиля ({name})?\n\nПеред удалением лаунчер сделает резервную копию всех сохранений — её можно вернуть на вкладке «Сейвы». Основные сохранения игры не трогаются.").format(name=name), parent=window):
+                return
+            try:
+                saves.backup("Перед сбросом сейва профиля", profile["name"])  # переводится при показе
+                for f in files:
+                    f.unlink()
+            except OSError as exc:
+                return messagebox.showerror(tr("Не удалось сбросить"), str(exc), parent=window)
+            self.log(tr("Сейв профиля «{name}» сброшен: {files}").format(name=profile["name"], files=", ".join(f.name for f in files)))
+            self.scene.toast(tr("Сейв профиля сброшен, резервная копия сохранена"))
 
         # Нижние блоки пакуем первыми (side=bottom), чтобы список занял остаток.
         me3_card = tk.Frame(window, bg=CARD, highlightthickness=1, highlightbackground=CARD_BORDER)
@@ -976,7 +1162,27 @@ class Launcher(tk.Tk):
         entry.bind("<FocusOut>", save_options)
         entry.bind("<Return>", save_options)
         Tooltip(entry, tr("Имя файла сохранения для этого профиля, например ER0000.mod.sl2 — так моды не испортят основные сохранения."))
-        self._button(options, tr("Создать .me3"), write_manifest, 150, 38).pack(side="right")
+        self._button(options, tr("Файл .me3 ▾"), me3_menu, 150, 38,
+                     tooltip=tr("Свой файл профиля ME3: создать, выбрать, редактировать, удалить; выбор профиля модпака")).pack(side="right")
+        # Чем запускается профиль и в какой файл идут сохранения.
+        status = tk.Frame(me3_inner, bg=CARD)
+        status.pack(fill="x", pady=(8, 0))
+        custom = profiles.custom_me3(profile)
+        if custom:
+            how = tr("Свой файл .me3 (ручной режим): {path}").format(path=custom)
+        elif profile.get("me3_custom"):
+            how = tr("Свой файл .me3 не найден ({path}) — используется автосборка").format(path=profile["me3_custom"])
+        else:
+            how = tr("Файл .me3 собирает лаунчер из списка модов")
+        save_name = profiles.profile_savefile(profile)
+        how += "   ·   " + (tr("сейвы: {file}").format(file=save_name) if save_name else tr("сейвы: обычные (ER0000.sl2)"))
+        tk.Label(status, text=how, bg=CARD, fg=GOLD if custom else DIM, font=(FONT, -12), anchor="w").pack(side="left", fill="x", expand=True)
+        if save_name:
+            self._button(status, tr("Сбросить сейв"), reset_save, 140, 32,
+                         tooltip=tr("Начать этот профиль с чистого листа (с резервной копией)")).pack(side="right")
+        if custom:
+            entry.configure(state="disabled")
+            Tooltip(entry, tr("В ручном режиме savefile задаётся в самом файле .me3"))
 
         buttons = tk.Frame(window, bg=PAGE_BG)
         buttons.pack(fill="x", side="bottom", padx=20, pady=(0, 10))
@@ -1034,6 +1240,113 @@ class Launcher(tk.Tk):
         mods.bind("<Delete>", lambda _e: remove())
         redraw(0 if profile.get("mods") else None)
         mods.focus_set()
+
+    def edit_me3(self, profile, path):
+        """Редактор файла профиля ME3. path=None — просмотр того, что соберёт лаунчер."""
+        set_active_tab(self, "mods")
+        readonly = path is None
+        subtitle = tr("{name} · так лаунчер соберёт .me3 (только просмотр)").format(name=profile["name"]) if readonly \
+            else f"{profile['name']} · {path}"
+        window = self._open_tab(".me3", subtitle)
+        try:
+            text = profiles.render_me3(profile) if readonly else Path(path).read_text(encoding="utf-8-sig")
+        except OSError as exc:
+            messagebox.showerror(tr("Не удалось открыть"), str(exc), parent=self)
+            return self.manage_mods()
+
+        actions = tk.Frame(window, bg=PAGE_BG)
+        actions.pack(fill="x", side="bottom", padx=20, pady=(0, 16))
+        state = tk.Label(actions, text="", bg=PAGE_BG, fg=DIM, font=(FONT, -13), anchor="w")
+        hint = tr("Пути можно писать абсолютные или относительно файла (./../mod). Seamless (ersc.dll) — первым в [[natives]] и с load_early = true.")
+        tk.Label(window, text=hint, bg=PAGE_BG, fg=DIM, font=(FONT, -12), anchor="w").pack(fill="x", side="bottom", padx=20, pady=(0, 6))
+
+        box = tk.Frame(window, bg="#11100d", highlightthickness=1, highlightbackground=CARD_BORDER)
+        box.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        scroll = ttk.Scrollbar(box, orient="vertical")
+        scroll.pack(side="right", fill="y")
+        editor = tk.Text(box, bg="#11100d", fg=TEXT, font=("Consolas", -15), wrap="none", relief="flat", undo=True,
+                         padx=16, pady=12, yscrollcommand=scroll.set, borderwidth=0,
+                         selectbackground="#4a3c20", selectforeground="#fff5d3", insertbackground=GOLD)
+        scroll.configure(command=editor.yview)
+        editor.pack(fill="both", expand=True)
+        editor.insert("1.0", text)
+        editor.edit_reset()
+        editor.edit_modified(False)
+        if readonly:
+            editor.configure(state="disabled")
+
+        def check():
+            content = editor.get("1.0", "end-1c")
+            error = profiles.check_me3_text(content)
+            if error:
+                state.configure(text=tr(error), fg=WARN)
+            elif profiles.seamless_without_early(content):
+                state.configure(text=tr("Под ersc.dll (Seamless) нужна строка load_early = true"), fg=WARN)
+            else:
+                state.configure(text=tr("Файл в порядке"), fg=OK)
+            return error
+
+        def check_with_me3():
+            if check():
+                return
+            me3 = self._find_me3(profile)
+            if not me3:
+                return state.configure(text=tr("me3.exe не найден — проверена только структура файла"), fg=WARN)
+            save(quiet=True)
+            try:
+                result = subprocess.run([str(me3), "profile", "show", "-f", str(path)], capture_output=True, text=True,
+                                        timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return state.configure(text=str(exc), fg=WARN)
+            if result.returncode == 0:
+                state.configure(text=tr("ME3 принял файл"), fg=OK)
+            else:
+                lines = (result.stderr or result.stdout).strip().splitlines()
+                message = lines[-1] if lines else ""
+                state.configure(text=tr("ME3: {error}").format(error=message[-160:]), fg=WARN)
+                self.log(tr("Проверка .me3: {error}").format(error=(result.stderr or result.stdout).strip()[-800:]))
+
+        def save(quiet=False):
+            content = editor.get("1.0", "end-1c")
+            error = profiles.check_me3_text(content)
+            if error and not quiet and not messagebox.askyesno(tr("Ошибка в файле"), tr("{error}\n\nВсё равно сохранить?").format(error=tr(error)), parent=self):
+                return False
+            try:
+                Path(path).write_text(content, encoding="utf-8")
+            except OSError as exc:
+                messagebox.showerror(tr("Не удалось сохранить"), str(exc), parent=self)
+                return False
+            editor.edit_modified(False)
+            if not quiet:
+                state.configure(text=tr("Сохранено"), fg=OK)
+                self.scene.toast(tr("Файл .me3 сохранён"))
+            return True
+
+        def back():
+            if not readonly and editor.edit_modified() and messagebox.askyesno(
+                    tr("Несохранённые изменения"), tr("Сохранить изменения в файле .me3?"), parent=self):
+                if not save():
+                    return
+            self.manage_mods()
+
+        def make_own():
+            new = profiles.create_custom_me3(self.data, profile)
+            self.log(tr("Создан свой .me3: {path}").format(path=new))
+            self.edit_me3(profile, new)
+
+        self._button(actions, tr("Назад"), back, 120, 44).pack(side="left", padx=(0, 8))
+        if readonly:
+            self._button(actions, tr("Сделать своим и редактировать"), make_own, 290, 44,
+                         tooltip=tr("Сохранить этот текст как свой .me3 профиля — дальше лаунчер запускает его как есть")).pack(side="left")
+        else:
+            self._button(actions, tr("Сохранить"), save, 150, 44).pack(side="left", padx=(0, 8))
+            self._button(actions, tr("Проверить через ME3"), check_with_me3, 210, 44).pack(side="left", padx=(0, 8))
+            self._button(actions, tr("Открыть в блокноте"), lambda: (save(quiet=True), os.startfile(path)), 200, 44).pack(side="left")
+            editor.bind("<Control-s>", lambda _e: (save(), "break")[1])
+            editor.bind("<Control-S>", lambda _e: (save(), "break")[1])
+            editor.focus_set()
+        state.pack(side="left", fill="x", expand=True, padx=(12, 0))
+        check()
 
     # ── сохранения ─────────────────────────────────────────────────────
 
@@ -1155,7 +1468,12 @@ class Launcher(tk.Tk):
                 return
             if p and profiles.game_exe(p["path"]).is_file():
                 self._auto_backup(p)
-            if self._launch_profile():
+            if p and not self._prepare_loaders(p):
+                return
+            launched = self._launch_profile()
+            if not launched:
+                self._restore_loaders()
+            if launched:
                 p = self._profile()
                 p["last_played"] = datetime.now().strftime("%d.%m, %H:%M")
                 profiles.save(self.data)
@@ -1171,6 +1489,72 @@ class Launcher(tk.Tk):
             messagebox.showerror(tr("Не удалось запустить игру"), str(exc), parent=self)
         finally:
             self.after(2000, self._clear_launch_pending)
+
+    # ── сторонние загрузчики модов в папке игры (dinput8.dll и т. п.) ────
+
+    def _loaders_apply(self, p):
+        """Запуск без EAC: сторонние DLL из папки игры загрузятся вместе с ней."""
+        via_me3 = p.get("kind") == "pack" or any(m.get("enabled", True) for m in p.get("mods", []))
+        return via_me3 or profiles.launch_mode(p) != "online"  # чистый онлайн идёт через EAC — он их не пустит
+
+    def _prepare_loaders(self, p):
+        """Спрашивает (один раз для профиля), отключать ли сторонние загрузчики
+        на время игры. False — пользователь отменил запуск."""
+        exe = profiles.game_exe(p["path"])
+        found = profiles.foreign_loaders(exe.parent) if exe.is_file() else []
+        if not found or not self._loaders_apply(p):
+            return True
+        names = ", ".join(profiles.foreign_loader_label(f) for f in found)
+        choice = p.get("foreign_loaders")
+        if choice not in ("disable", "keep"):
+            self.scene.react("confused")
+            answer = messagebox.askyesnocancel(
+                tr("Сторонние загрузчики модов"),
+                tr("В папке игры найдены сторонние загрузчики модов:\n{names}\n\n"
+                   "Без Easy Anti-Cheat игра загрузит их вместе с собой. Старые моды через них часто ломают "
+                   "управление (персонаж не ходит, только поворачивается), камеру или вызывают вылеты.\n\n"
+                   "«Да» — отключать их на время игры из лаунчера (после выхода файлы вернутся на место).\n"
+                   "«Нет» — оставить как есть.\n\nВыбор запомнится для профиля «{name}»; изменить можно в меню профиля.").format(
+                    names=names, name=p["name"]), parent=self)
+            if answer is None:
+                return False
+            choice = "disable" if answer else "keep"
+            p["foreign_loaders"] = choice
+            profiles.save(self.data)
+        if choice == "keep":
+            self.log(tr("Сторонние загрузчики остаются включёнными: {names}").format(names=names))
+            return True
+        renamed = profiles.disable_loaders(exe.parent)
+        if renamed:
+            settings = self._settings()
+            settings["renamed_loaders"] = sorted(set(settings.get("renamed_loaders", [])) | set(renamed))
+            profiles.save(self.data)
+            self.log(tr("Отключены на время игры: {names}").format(names=names))
+        if len(renamed) < len(found):
+            self.log(tr("Не удалось отключить часть загрузчиков (нет прав на запись в папку игры?)"))
+        return True
+
+    def _restore_loaders(self):
+        settings = self._settings()
+        pending = settings.get("renamed_loaders")
+        if not pending:
+            return
+        left = profiles.restore_loaders(pending)
+        if len(left) < len(pending):
+            self.log(tr("Сторонние загрузчики возвращены на место"))
+        if left:
+            settings["renamed_loaders"] = left
+        else:
+            settings.pop("renamed_loaders", None)
+        profiles.save(self.data)
+
+    def set_loader_choice(self, choice):
+        p = self._profile()
+        if p:
+            p["foreign_loaders"] = choice
+            profiles.save(self.data)
+            self.scene.toast(tr("Сторонние загрузчики: {state}").format(
+                state=tr("отключаются на время игры") if choice == "disable" else tr("загружаются вместе с игрой")))
 
     def _clear_launch_pending(self):
         self.launch_pending = False
@@ -1220,6 +1604,7 @@ class Launcher(tk.Tk):
 
     def _game_closed(self, name):
         profile = self._find_profile(name)
+        self._restore_loaders()
         self.log(tr("Игра закрыта · профиль «{name}»").format(name=name))
         if profile and profile.get("playtime"):
             self.scene.toast(tr("Всего в «{name}»: {time}").format(
@@ -1246,9 +1631,12 @@ class Launcher(tk.Tk):
         if coop and not Path(coop["path"]).is_file():
             messagebox.showerror(tr("Seamless Co-op не найден"), tr("Файл Seamless Co-op не найден:\n{path}\n\nПодключите его заново во вкладке «Моды».").format(path=coop["path"]), parent=self)
             return False
-        if enabled or p.get("savefile"):
+        custom = profiles.custom_me3(p)
+        if p.get("me3_custom") and not custom:
+            self.log(tr("Свой файл .me3 не найден ({path}) — используется автосборка").format(path=p["me3_custom"]))
+        if enabled or p.get("savefile") or custom:
             me3 = self._find_me3(p)
-            if not me3 and coop and len(enabled) == 1:
+            if not me3 and coop and len(enabled) == 1 and not custom:
                 # Только Seamless и нет ME3 — запускаем его собственным лаунчером.
                 launcher = next((c for c in (Path(coop["path"]).parent.parent / "ersc_launcher.exe",
                                              exe.parent / "ersc_launcher.exe") if c.is_file()), None)
@@ -1260,8 +1648,13 @@ class Launcher(tk.Tk):
                                      tr("Откройте вкладку «Моды», нажмите «Указать me3.exe» и выберите официальный me3.exe."), parent=self)
                 return False
             manifest = profiles.write_me3_profile(self.data, p)
+            self.log(tr("Mod Engine 3: {me3} · профиль {path}").format(me3=me3, path=manifest))
+            command = self._me3_command(me3, manifest, exe)
+            mode = profiles.launch_mode(p)
+            if mode in ("online", "offline"):  # режим профиля; Seamless сам решает, куда подключаться
+                command += ["--online", "true" if mode == "online" else "false"]
             try:
-                subprocess.Popen(self._me3_command(me3, manifest, exe), cwd=str(me3.parent))
+                subprocess.Popen(command, cwd=str(me3.parent))
             except OSError as exc:
                 messagebox.showerror(tr("Не удалось запустить ME3"), str(exc), parent=self)
                 return False
@@ -1276,10 +1669,15 @@ class Launcher(tk.Tk):
             if not eac.is_file():
                 messagebox.showerror(tr("Онлайн недоступен"), tr("В папке профиля нет start_protected_game.exe (лаунчер Easy Anti-Cheat). Переключите профиль в офлайн или проверьте файлы игры в Steam."), parent=self)
                 return False
+            if self._in_steam_library(exe):
+                # Игра из Steam-библиотеки — запускаем через сам Steam, ровно как кнопка «Играть» в Steam
+                # (Steam Input, оверлей и EAC работают как обычно).
+                os.startfile(f"steam://rungameid/{profiles.STEAM_APP_ID}")
+                return True
             if not steam_checks.steam_running():
                 messagebox.showerror(tr("Steam не запущен"), tr("Для онлайна нужен запущенный Steam. Запустите его или переключите профиль в офлайн."), parent=self)
                 return False
-            self._write_appid(game_dir)  # чтобы копия запускалась из своей папки, а не из Steam-библиотеки
+            self._write_appid(game_dir)  # копия вне Steam: иначе Steam перезапустит игру из своей библиотеки
             subprocess.Popen([str(eac)], cwd=str(game_dir))
             return True
         # Офлайн: steam_appid.txt + прямой запуск eldenring.exe — без EAC и серверов.
@@ -1328,6 +1726,10 @@ class Launcher(tk.Tk):
         subprocess.Popen(self._me3_command(me3, profile_file, exe) + ["--online", "true" if online else "false"],
                          cwd=str(profile_file.parent))
         return True
+
+    @staticmethod
+    def _in_steam_library(exe):
+        return "steamapps" in {part.lower() for part in Path(exe).parts}
 
     @staticmethod
     def _me3_command(me3, profile_file, exe):
@@ -1387,6 +1789,40 @@ class Launcher(tk.Tk):
         self.scene.react("smug")
         self._refresh_open_page()
 
+    def import_me3_file(self, path=None):
+        """Новый профиль, который запускается напрямую по выбранному файлу .me3."""
+        path = path or filedialog.askopenfilename(parent=self, title=tr("Выберите файл профиля .me3"),
+                                                  filetypes=[(tr("Профиль Mod Engine 3"), "*.me3"), (tr("Все файлы"), "*.*")])
+        if not path:
+            return
+        path = Path(path).resolve()
+        error = profiles.check_me3_text(path.read_text(encoding="utf-8-sig")) if path.is_file() else tr("Файл не найден")
+        if error and not messagebox.askyesno(tr("Ошибка в файле"), tr("{error}\n\nВсё равно добавить?").format(error=tr(error)), parent=self):
+            return
+        base = self._base_game_profile()
+        if not base:
+            return messagebox.showerror(tr("Нет игры"), tr("Модпак запускается через Mod Engine 3 и использует вашу игру. Сначала добавьте игру в библиотеку."), parent=self)
+        default = path.parent.parent.name if path.parent.name.lower() == "me3" else path.parent.name
+        name = simpledialog.askstring(tr("Профиль из .me3"), tr("Файл: {file}\n\nНазвание профиля:").format(file=path.name),
+                                      initialvalue=default or path.stem, parent=self)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        if not self._confirm_new_name(name):
+            return
+        profiles.add(self.data, name, base["path"], "pack")
+        p = self._find_profile(name)
+        p.update({"pack_dir": str(path.parent), "pack_type": "me3file", "me3_custom": str(path), "launch_mode": "offline"})
+        if base.get("game_version"):
+            p["game_version"] = base["game_version"]
+        profiles.save(self.data)
+        self.log(tr("Профиль «{name}» запускается по файлу {path}").format(name=name, path=path))
+        self.refresh()
+        self._select_by_name(name)
+        self.scene.toast(tr("Профиль «{name}» добавлен").format(name=name))
+        self.scene.react("smug")
+        self._refresh_open_page()
+
     def _add_pack_entry(self, profile, folder, quiet=False):
         """Модпак как элемент списка модов. Если внутри модпака лежит Seamless
         Co-op, а к профилю он ещё не подключён, — подключает и его."""
@@ -1413,6 +1849,12 @@ class Launcher(tk.Tk):
         me3 = profiles.find_me3(self.data)
         if me3:
             return me3
+        custom = profiles.custom_me3(profile)
+        if custom:  # готовый .me3 из модпака: me3.exe обычно лежит рядом
+            for candidate in (custom.parent / "Windows" / "me3.exe", custom.parent / "me3.exe",
+                              custom.parent.parent / "me3" / "Windows" / "me3.exe"):
+                if candidate.is_file():
+                    return candidate
         for mod in profile.get("mods", []):
             if profiles.is_me3_pack(mod):
                 for candidate in (Path(mod["path"]) / "me3" / "Windows" / "me3.exe", Path(mod["path"]) / "me3" / "me3.exe",
@@ -1740,7 +2182,8 @@ class Launcher(tk.Tk):
     # ── режим запуска (онлайн / офлайн) ────────────────────────────────
 
     def mode_label(self, profile):
-        return {"online": tr("Онлайн · EAC") if profile.get("kind") not in ("mods", "pack") else tr("Онлайн-серверы ME3"),
+        modded = profile.get("kind") in ("mods", "pack") or any(m.get("enabled", True) for m in profile.get("mods", []))
+        return {"online": tr("Онлайн-серверы ME3") if modded else tr("Онлайн · EAC"),
                 "offline": tr("Офлайн · без EAC"),
                 "seamless": tr("Seamless Co-op · свои серверы"),
                 "pack": tr("Свой загрузчик модпака")}[profiles.launch_mode(profile)]
@@ -1750,7 +2193,7 @@ class Launcher(tk.Tk):
         if not p or profiles.launch_mode(p) in ("seamless", "pack") or profiles.launch_mode(p) == mode:
             return
         if mode == "online":
-            if p.get("kind") in ("mods", "pack"):
+            if p.get("kind") in ("mods", "pack") or any(m.get("enabled", True) for m in p.get("mods", [])):
                 self.scene.react("angry")
                 if not messagebox.askyesno(tr("Онлайн с модами"), tr("Подключение к официальным серверам с модами может привести к блокировке аккаунта (мягкий бан).\n\nВключить онлайн для профиля «{name}»?").format(name=p["name"]), parent=self):
                     return
@@ -1998,6 +2441,7 @@ class Launcher(tk.Tk):
             ((tr("Играть"), self.launch), (tr("Открыть папку"), self.open_folder)),
             ((tr("Модпак и его настройки") if p.get("kind") == "pack" else tr("Моды и Seamless Co-op"), self.manage_mods),
              (tr("Импортировать модпак…"), self.import_modpack),
+             (tr("Профиль из файла .me3…"), self.import_me3_file),
              (tr("Создать копию для модов"), self.create_mod)),
             ((tr("Сменить обложку…"), self.change_cover),) + (((tr("Убрать обложку"), self.remove_cover),) if p.get("cover") else ()),
             ((tr("Переименовать"), self.rename_profile), (tr("Исправить путь"), self.repair_profile),
@@ -2017,9 +2461,21 @@ class Launcher(tk.Tk):
                 menu._mode_var = current  # держим ссылку, пока меню открыто
                 modes.add_radiobutton(label=tr("Офлайн · без EAC (рекомендуется)"), variable=current, value="offline",
                                       command=lambda: self.set_launch_mode("offline"))
-                modes.add_radiobutton(label=tr("Онлайн · EAC") if p.get("kind") != "mods" else tr("Онлайн-серверы ME3 (риск бана)"),
+                modded = p.get("kind") in ("mods", "pack") or any(m.get("enabled", True) for m in p.get("mods", []))
+                modes.add_radiobutton(label=tr("Онлайн-серверы ME3 (риск бана)") if modded else tr("Онлайн · EAC"),
                                       variable=current, value="online", command=lambda: self.set_launch_mode("online"))
                 menu.add_cascade(label=tr("Режим запуска: {mode}").format(mode=self.mode_label(p)), menu=modes)
+            exe = profiles.game_exe(p["path"])
+            if i == 0 and exe.is_file() and profiles.foreign_loaders(exe.parent):
+                loaders = tk.Menu(menu, tearoff=False, bg=PANEL, fg=TEXT, activebackground="#443b2d",
+                                  activeforeground=GOLD, selectcolor=GOLD, font=(FONT, -16))
+                choice = tk.StringVar(value=p.get("foreign_loaders", ""))
+                menu._loader_var = choice
+                loaders.add_radiobutton(label=tr("Отключать на время игры (рекомендуется)"), variable=choice,
+                                        value="disable", command=lambda: self.set_loader_choice("disable"))
+                loaders.add_radiobutton(label=tr("Загружать вместе с игрой"), variable=choice,
+                                        value="keep", command=lambda: self.set_loader_choice("keep"))
+                menu.add_cascade(label=tr("Сторонние загрузчики (dinput8 и др.)"), menu=loaders)
         x = event.x_root if event else self.winfo_pointerx()
         y = event.y_root if event else self.winfo_pointery()
         try:

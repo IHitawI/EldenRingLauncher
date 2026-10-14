@@ -1,7 +1,7 @@
 """Версия, автор и юридические тексты — в одном месте для заставки, настроек, FAQ и README."""
 
 APP_NAME = "Elden Ring Launcher"
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 AUTHOR = "IWaithI"
 DISCORD = "iwaithi"
 ASSISTANT = "IWaithI"

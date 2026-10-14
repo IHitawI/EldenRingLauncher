@@ -6,6 +6,7 @@
 - просто папкой с файлами игры (regulation.bin, chr, parts…) и/или DLL.
 Лаунчер определяет тип сам, чтобы запускать мод так, как задумал автор.
 """
+import os
 from pathlib import Path
 
 # Папки и файлы, которые лежат в корне пакета ассетов Elden Ring.
@@ -113,12 +114,11 @@ def detect(folder) -> dict:
     """Тип модпака: "me3" (готовый профиль), "loader" (свой загрузчик/.bat) или "files"."""
     folder = Path(folder)
     me3_profiles, me3_exe, bats, me2_launcher, me2_config = [], None, [], None, None
+    me3_profiles = find_me3_files(folder)
     for entry, depth in _walk(folder):
         name = entry.name.lower()
         if entry.is_file():
-            if entry.suffix.lower() == ".me3" and depth <= 2:
-                me3_profiles.append(entry)
-            elif name == "me3.exe":
+            if name == "me3.exe":
                 # Модпаки кладут рядом сборки для Windows и для Linux/Proton — берём Windows.
                 parts = {p.lower() for p in entry.parts}
                 if me3_exe is None or ("linux" in {p.lower() for p in me3_exe.parts} and "linux" not in parts):
@@ -129,7 +129,7 @@ def detect(folder) -> dict:
                 me2_launcher = entry
             elif name.startswith("config_eldenring") and entry.suffix.lower() == ".toml":
                 me2_config = entry
-    info = {"folder": folder, "me3_profiles": sorted(me3_profiles), "me3_exe": me3_exe, "bats": sorted(bats),
+    info = {"folder": folder, "me3_profiles": me3_profiles, "me3_exe": me3_exe, "bats": sorted(bats),
             "me2_launcher": me2_launcher, "me2_config": me2_config}
     if me3_profiles:
         info["type"] = "me3"
@@ -141,6 +141,15 @@ def detect(folder) -> dict:
         info["packages"] = find_package_roots(folder)
         info["dlls"] = find_dlls(folder)
     return info
+
+
+def find_me3_files(folder) -> list[Path]:
+    """Профили .me3 на любой глубине, включая скрытые папки и файлы (os.walk их не пропускает)."""
+    folder = Path(folder)
+    found = []
+    for root, _dirs, files in os.walk(folder, onerror=lambda _e: None):
+        found += [Path(root) / name for name in files if name.lower().endswith(".me3")]
+    return sorted(found, key=lambda p: (len(p.relative_to(folder).parts), str(p).lower()))
 
 
 def _launch_bats(bats):
