@@ -494,7 +494,7 @@ class Launcher(tk.Tk):
         ready = profiles.game_exe(profile["path"]).is_file()
         return {
             "title": profile["name"],
-            "subtitle": profile["path"],
+            "subtitle": profiles.display_path(profile),
             "badge": self.scene.kind_label(profile).upper(),
             "status": OK if ready else WARN,
             "meta": (self.profile_meta(profile) or tr("готов")) if ready else tr("нет eldenring.exe"),
@@ -779,13 +779,15 @@ class Launcher(tk.Tk):
             profiles.remove(self.data, p["name"]); self.refresh()
             self._refresh_open_page()
 
-    def open_folder(self):
+    def open_folder(self, game=False):
+        """Папка профиля: у модпака — папка модпака (game=True — папка игры)."""
         p = self._profile()
         if not p:
             return
-        if not Path(p["path"]).is_dir():
-            return messagebox.showerror(tr("Папка недоступна"), tr("Папка не найдена:\n{path}").format(path=p["path"]), parent=self)
-        os.startfile(p["path"])
+        path = p["path"] if game else profiles.display_path(p)
+        if not Path(path).is_dir():
+            return messagebox.showerror(tr("Папка недоступна"), tr("Папка не найдена:\n{path}").format(path=path), parent=self)
+        os.startfile(path)
 
     # ── моды и Seamless Co-op ──────────────────────────────────────────
 
@@ -2438,7 +2440,9 @@ class Launcher(tk.Tk):
         p = self._profile()
         menu = tk.Menu(self,tearoff=False,bg=PANEL,fg=TEXT,activebackground="#443b2d",activeforeground=GOLD,font=(FONT,-16))
         groups = (
-            ((tr("Играть"), self.launch), (tr("Открыть папку"), self.open_folder)),
+            ((tr("Играть"), self.launch),
+             (tr("Открыть папку модпака") if p.get("kind") == "pack" else tr("Открыть папку"), self.open_folder))
+            + (((tr("Открыть папку игры"), lambda: self.open_folder(game=True)),) if p.get("kind") == "pack" else ()),
             ((tr("Модпак и его настройки") if p.get("kind") == "pack" else tr("Моды и Seamless Co-op"), self.manage_mods),
              (tr("Импортировать модпак…"), self.import_modpack),
              (tr("Профиль из файла .me3…"), self.import_me3_file),

@@ -1092,7 +1092,7 @@ class LauncherScene(tk.Canvas):
             if ready and p.get("last_played"):
                 status += f"  ·  {self.tt('home.last_played')} {p['last_played']}"
             self.text(left+18, dot_y, elide(status, self.font(16), column-18), 16, INK if ready else WARN, "w")
-            self.text(left, center_y+16, elide(p["path"], self.font(14), column, middle=True), 14, DIM)
+            self.text(left, center_y+16, elide(profiles.display_path(p), self.font(14), column, middle=True), 14, DIM)
             # Плашка режима запуска (офлайн/онлайн) — щелчок переключает.
             mode = profiles.launch_mode(p)
             label = self.app.mode_label(p)

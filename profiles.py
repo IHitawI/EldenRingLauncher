@@ -159,6 +159,14 @@ def clone_vanilla(source: str, target: str, progress=None, files=None) -> None:
         progress(total, total, "")
 
 
+def display_path(profile: dict) -> str:
+    """Папка, которую показываем и открываем: у модпака — папка модпака
+    (игра для него — лишь основа), у остальных — папка игры."""
+    if profile.get("kind") == "pack" and profile.get("pack_dir"):
+        return profile["pack_dir"]
+    return profile.get("path", "")
+
+
 def game_exe(path: str) -> Path:
     root = Path(path)
     direct = root / "eldenring.exe"

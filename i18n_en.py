@@ -577,4 +577,6 @@ EN = {
     "В разделах [[natives]] и [[packages]] у каждой записи должен быть path": "Every [[natives]] and [[packages]] entry needs a path",
     "Seamless вписан в свой .me3 первым, с load_early = true: {path}": "Seamless added first to your .me3, with load_early = true: {path}",
     "Под ersc.dll (Seamless) нужна строка load_early = true": "ersc.dll (Seamless) needs the line load_early = true under it",
+    "Открыть папку модпака": "Open modpack folder",
+    "Открыть папку игры": "Open game folder",
 }
